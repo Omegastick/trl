@@ -26,7 +26,6 @@ from transformers.generation import TopKLogitsWarper, TopPLogitsWarper
 
 from .import_utils import is_npu_available, is_xpu_available
 
-
 try:
     from collections.abc import Mapping
 except ImportError:
@@ -128,10 +127,14 @@ def pad_to_size(tensor: torch.Tensor, size: int, dim: int = 1, padding: int = 50
         return torch.nn.functional.pad(tensor, (0, size - t_size), "constant", padding)
 
 
-def logprobs_from_logits(logits: torch.Tensor, labels: torch.Tensor, gather: bool = True) -> torch.Tensor:
+def logprobs_from_logits(
+    logits: torch.Tensor, labels: torch.Tensor, token_masks: Optional[torch.Tensor] = None, gather: bool = True
+) -> torch.Tensor:
     """
     See: https://github.com/pytorch/pytorch/issues/563#issuecomment-330103591
     """
+    if token_masks is not None:
+        logits = logits * token_masks
     logp = F.log_softmax(logits, dim=2)
 
     if not gather:

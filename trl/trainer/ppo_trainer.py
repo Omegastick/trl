@@ -581,6 +581,7 @@ class PPOTrainer(BaseTrainer):
         responses: List[torch.LongTensor],
         scores: List[torch.FloatTensor],
         masks: Optional[List[torch.LongTensor]] = None,
+        token_masks: Optional[List[torch.LongTensor]] = None,
     ):
         """
         Check if the input data is valid for training.
@@ -596,6 +597,8 @@ class PPOTrainer(BaseTrainer):
                 List of tensors containing the scores.
             masks (List[`torch.LongTensor`], *optional*):
                 list of optional tensors containing the masks of shape (`query_length` + `response_length`)
+            token_masks (List[`torch.LongTensor`], *optional*):
+                list of optional tensors containing token masks of shape (`query_length` + `response_length`, `vocab_size`)
         Returns:
             `tuple`: The input processed data.
         """
@@ -614,6 +617,7 @@ class PPOTrainer(BaseTrainer):
         responses = [tensor.to(self.current_device) for tensor in responses]
         scores = [tensor.to(self.current_device) for tensor in scores]
         masks = [tensor.to(self.current_device) for tensor in masks] if masks is not None else None
+        token_masks = [tensor.to(self.current_device) for tensor in token_masks] if token_masks is not None else None
 
         # squeeze scores if needed
         for i, score in enumerate(scores):
@@ -622,7 +626,7 @@ class PPOTrainer(BaseTrainer):
             elif score.dim() == 1:
                 scores[i] = score.squeeze()
 
-        return queries, responses, scores, masks
+        return queries, responses, scores, masks, token_masks
 
     @PPODecorators.empty_device_cache()
     def step(
@@ -631,6 +635,7 @@ class PPOTrainer(BaseTrainer):
         responses: List[torch.LongTensor],
         scores: List[torch.FloatTensor],
         response_masks: Optional[List[torch.LongTensor]] = None,
+        token_masks: Optional[List[torch.LongTensor]] = None,
     ):
         """
         Run a PPO optimisation step given a list of queries, model responses, and rewards.
@@ -644,16 +649,20 @@ class PPOTrainer(BaseTrainer):
                 List of tensors containing the scores.
             response_masks (List[`torch.FloatTensor`], *optional*)):
                 List of tensors containing masks of the response tokens.
+            token_masks (List[`torch.FloatTensor`], *optional*):
+                List of tensors containing token ID masks of shape (`query_length` + `response_length`, `vocab_size`)
 
         Returns:
             `dict[str, Any]`: A summary of the training statistics
         """
         bs = self.config.batch_size
 
-        queries, responses, scores, response_masks = self._step_safety_checker(
-            bs, queries, responses, scores, response_masks
+        queries, responses, scores, response_masks, token_masks = self._step_safety_checker(
+            bs, queries, responses, scores, response_masks, token_masks
         )
         scores = torch.tensor(scores, device=self.current_device)
+        if token_masks is not None:
+            token_masks = torch.stack(token_masks).to(self.current_device)
         if self.config.use_score_scaling:
             # Score scaling
             scores_mean, scores_std = self.running.update(scores)
@@ -724,6 +733,7 @@ class PPOTrainer(BaseTrainer):
                 responses,
                 model_inputs,
                 response_masks=response_masks,
+                token_masks=token_masks,
                 return_logits=full_kl_penalty,
             )
             with self.optional_peft_ctx():
@@ -732,6 +742,7 @@ class PPOTrainer(BaseTrainer):
                     queries,
                     responses,
                     model_inputs,
+                    token_masks=token_masks,
                     return_logits=full_kl_penalty,
                 )
 
@@ -740,8 +751,8 @@ class PPOTrainer(BaseTrainer):
         with torch.no_grad():
             t = time.time()
             if full_kl_penalty:
-                active_full_logprobs = logprobs_from_logits(logits_or_none, None, gather=False)
-                ref_full_logprobs = logprobs_from_logits(ref_logits_or_none, None, gather=False)
+                active_full_logprobs = logprobs_from_logits(logits_or_none, None, token_masks, gather=False)
+                ref_full_logprobs = logprobs_from_logits(ref_logits_or_none, None, token_masks, gather=False)
 
                 rewards, non_score_reward, kls = self.compute_rewards(
                     scores, active_full_logprobs, ref_full_logprobs, masks
@@ -801,6 +812,7 @@ class PPOTrainer(BaseTrainer):
                             mini_batch_dict["responses"],
                             model_inputs,
                             return_logits=True,
+                            token_masks=token_masks,
                         )
                         train_stats = self.train_minibatch(
                             mini_batch_dict["logprobs"],
@@ -957,6 +969,7 @@ class PPOTrainer(BaseTrainer):
         model_inputs: dict,
         return_logits: bool = False,
         response_masks: Optional[torch.Tensor] = None,
+        token_masks: Optional[torch.Tensor] = None,
     ):
         """
         Calculate model outputs in multiple batches.
@@ -991,6 +1004,8 @@ class PPOTrainer(BaseTrainer):
             response_batch = responses[i * fbs : (i + 1) * fbs]
             if response_masks is not None:
                 response_masks_batch = response_masks[i * fbs : (i + 1) * fbs]
+            if token_masks is not None:
+                token_masks_batch = token_masks[i * fbs : (i + 1) * fbs]
             logits, _, values = model(**input_kwargs)
 
             if self.is_encoder_decoder:
@@ -1000,7 +1015,9 @@ class PPOTrainer(BaseTrainer):
                 input_ids = input_kwargs["input_ids"]
                 attention_mask = input_kwargs["attention_mask"]
 
-            logprobs = logprobs_from_logits(logits[:, :-1, :], input_ids[:, 1:])
+            logprobs = logprobs_from_logits(
+                logits[:, :-1, :], input_ids[:, 1:], token_masks_batch[:, :-1, :]
+            )
             masks = torch.zeros_like(attention_mask)
             masks[:, :-1] = attention_mask[:, 1:]
 
