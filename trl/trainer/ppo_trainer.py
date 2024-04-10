@@ -1244,6 +1244,7 @@ class PPOTrainer(BaseTrainer):
             loss = loss * 0.0
 
         entropy = masked_mean(entropy_from_logits(logits), mask)
+        loss -= self.config.entropy_coef * entropy
 
         approxkl = 0.5 * masked_mean((logprobs - old_logprobs) ** 2, mask)
         policykl = masked_mean(old_logprobs - logprobs, mask)
